@@ -1,32 +1,31 @@
 # ESP32CAM wifi mqtt http : video surveillance
 Inspiration prise ici : https://github.com/ldab/ESP32-CAM-MQTT
- mais cela utilise le framework arduino qui a une grosse limitation
- sur le buffer size des images publiées en MQTT
- à cause du malloc() qui n'utilise pas la Flash RAM de 4Mo de l'ESP32-cam.
+ mais ce projet utilise le framework arduino qui a une grosse limitation
+ sur le buffer size des images publiées en MQTT,
+ à cause du malloc() qui n'utilise pas la Flash RAM de l'ESP32-cam.
 
 Voici ma réécriture avec PlatformIO et le framework esp-idf.
 L'idée est de faire fonctionner sur une ESP32-CAM :
  - le wifi en adresse IP fixe
  - l'abonnement sur MQTT pour la configuration de l'ESP32-CAM (utiliser [JSON à importer dans node-red](for_node-red.json) )
  - la publication sur MQTT de photos capturées par la camera
- - l'activation du serveur HTTP afficher l'image de la camera
+ - l'activation du serveur HTTP pour afficher l'image de la camera
  - le streaming video de la camera
+ - le stockage de l'adresse IP en NVS pour uploader le même code partout
 
-Modifier la configuration de l'ESP32-CAM à flasher :
+Adapter la configuration de l'ESP32-CAM à flasher :
 ```
 #define ESP_WIFI_SSID      "ssid"
 #define ESP_WIFI_PASS      "password"
-#define ESP_MAXIMUM_RETRY  5
-#define IP_ADDRESS         "192.168.1.20"
+#define IP_ADDRESS_PREFIX  "192.168.1."  // la dernière valeur est dans NVS (IP_number) modifiable par MQTT_TOPIC_CONFIG
+#define DEFAULT_IP_NUMBER  20
 #define GATEWAY            "192.168.1.1"
 #define NETMASK            "255.255.255.0"
+#define ESP_MAXIMUM_RETRY  5
 #define MQTT_BROKER_URL    "mqtt://192.168.1.136"
-#define MQTT_USERNAME      "user_mqtt"
-#define MQTT_PASSWORD      "pass_mqtt"
-#define MQTT_TOPIC_BOOT    "ESP32_CAM_20/Boot"
-#define MQTT_TOPIC_PHOTO   "ESP32_CAM_20/TakeAPicture"
-#define MQTT_TOPIC_CONFIG  "ESP32_CAM_20/JSONConfig"
-#define MQTT_TOPIC_PICTURE "ESP32_CAM_20/PICTURE"
+#define MQTT_USERNAME      "mqtt_username"
+#define MQTT_PASSWORD      "mqtt_password"
+#define MQTT_TOPIC_PREFIX  "ESP32_CAM_"
 ```
 
 **Attention**, l'ajout de la librairie esp32-camera ne fonctionne pas correctement sous PlatformIO.

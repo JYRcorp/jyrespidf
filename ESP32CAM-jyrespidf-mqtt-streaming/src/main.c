@@ -5,6 +5,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "driver/gpio.h"
 #include "nvs_flash.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -15,17 +16,26 @@
 
 #define ESP_WIFI_SSID      "ssid"
 #define ESP_WIFI_PASS      "password"
-#define ESP_MAXIMUM_RETRY  5
-#define IP_ADDRESS         "192.168.1.20"
+#define IP_ADDRESS_PREFIX  "192.168.1."  // la dernière valeur est dans NVS (IP_number) modifiable par MQTT_TOPIC_CONFIG
+#define DEFAULT_IP_NUMBER  20
 #define GATEWAY            "192.168.1.1"
 #define NETMASK            "255.255.255.0"
+#define ESP_MAXIMUM_RETRY  5
 #define MQTT_BROKER_URL    "mqtt://192.168.1.136"
-#define MQTT_USERNAME      "user_mqtt"
-#define MQTT_PASSWORD      "pass_mqtt"
-#define MQTT_TOPIC_BOOT    "ESP32_CAM_20/Boot"
-#define MQTT_TOPIC_PHOTO   "ESP32_CAM_20/TakeAPicture"
-#define MQTT_TOPIC_CONFIG  "ESP32_CAM_20/JSONConfig"
-#define MQTT_TOPIC_PICTURE "ESP32_CAM_20/PICTURE"
+#define MQTT_USERNAME      "username"
+#define MQTT_PASSWORD      "password"
+#define MQTT_TOPIC_PREFIX  "ESP32_CAM_"
+
+#define GPIO_OUTPUT_FLASH_LED    4   // PIN commun avec les DATA du port série donc l'eclairage de la LED vascille
+//#define GPIO_OUTPUT_FLASH_LED    3   //  (on peut toutefois bidouiller en supprimant R13 et y connecter le pin 3)
+#define GPIO_OUTPUT_PIN_SEL  ((1ULL<<GPIO_OUTPUT_FLASH_LED))
+
+static uint8_t IP_number=DEFAULT_IP_NUMBER;
+static char IP_ADDRESS[20];
+static char MQTT_TOPIC_BOOT[35];
+static char MQTT_TOPIC_PHOTO[35];
+static char MQTT_TOPIC_CONFIG[35];
+static char MQTT_TOPIC_PICTURE[35];
 
 static camera_config_t camera_config = {
   .ledc_channel = LEDC_CHANNEL_0,
@@ -58,6 +68,11 @@ static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" 
 static const char* _STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
 static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
 
+static int motionDetection=1;
+static int motionThrethold=50;
+static int motionNbPhoto=3;
+esp_mqtt_client_handle_t client;
+
 /* FreeRTOS event group to signal when we are connected*/
 static EventGroupHandle_t s_wifi_event_group;
 /* The event group allows multiple bits for each event, but we only care about two events:
@@ -71,6 +86,76 @@ uint8_t* buffer;
 size_t   bufferSize=0;
 int testMalloc(size_t size);
 void boucleTestMalloc();
+
+//-------------------------------------------------------------------------------------------------
+void write_nvs(nvs_handle_t handle, const char * key, uint8_t  value) {
+    nvs_handle_t h;
+    esp_err_t err;
+    if (handle==-1) {
+        err = nvs_open("storage", NVS_READWRITE, &h);
+        if (err != ESP_OK) 
+            printf("Error (%s) opening NVS handle!\n", esp_err_to_name(err));
+    }
+    else
+        h=handle;
+    printf("Save nvs : %s=%d \n", key, value);
+    err = nvs_set_u8(h, key, value);
+    printf((err != ESP_OK) ? "Failed!\n" : "Done\n");
+    err = nvs_commit(h);
+    printf((err != ESP_OK) ? "nvs_commit Failed!\n" : "nvs_commit Done\n");
+    if (handle==-1) 
+        nvs_close(h);
+} 
+
+//-------------------------------------------------------------------------------------------------
+void init_globals(void) {
+    IP_number=DEFAULT_IP_NUMBER;
+    nvs_handle_t my_handle;
+    esp_err_t err = nvs_open("storage", NVS_READWRITE, &my_handle);
+    if (err != ESP_OK) 
+        printf("Error (%s) opening NVS handle!\n", esp_err_to_name(err));
+    else {
+        err = nvs_get_u8(my_handle, "IP_number", &IP_number);
+        switch (err) {
+            case ESP_OK:
+                printf("IP_number dans NVS=%d\n", IP_number);
+                break;
+            case ESP_ERR_NVS_NOT_FOUND:
+                printf("IP_number is not initialized yet!\n");
+                IP_number=DEFAULT_IP_NUMBER;
+                write_nvs(my_handle, "IP_number", IP_number);
+                break;
+            default :
+                printf("Error (%s) reading!\n", esp_err_to_name(err));
+                IP_number=DEFAULT_IP_NUMBER;
+            }
+        nvs_close(my_handle);
+    }
+    // La valeur en NVS identifie l'esp-cam: adresse IP + topics MQTT
+    snprintf(IP_ADDRESS,         sizeof(IP_ADDRESS)+1,         "%s%d",              IP_ADDRESS_PREFIX, IP_number);
+    snprintf(MQTT_TOPIC_BOOT,    sizeof(MQTT_TOPIC_BOOT)+1,    "%s%d/Boot",         MQTT_TOPIC_PREFIX, IP_number);
+    snprintf(MQTT_TOPIC_PHOTO,   sizeof(MQTT_TOPIC_PHOTO)+1,   "%s%d/TakeAPicture", MQTT_TOPIC_PREFIX, IP_number);
+    snprintf(MQTT_TOPIC_CONFIG,  sizeof(MQTT_TOPIC_CONFIG)+1,  "%s%d/JSONConfig",   MQTT_TOPIC_PREFIX, IP_number);
+    snprintf(MQTT_TOPIC_PICTURE, sizeof(MQTT_TOPIC_PICTURE)+1, "%s%d/PICTURE",      MQTT_TOPIC_PREFIX, IP_number);
+}
+
+//-------------------------------------------------------------------------------------------------
+void init_gpio(void) {
+    gpio_config_t io_conf;
+    //disable interrupt
+    io_conf.intr_type = GPIO_PIN_INTR_DISABLE;
+    //set as output mode
+    io_conf.mode = GPIO_MODE_OUTPUT;
+    //bit mask of the pins that you want to set,e.g.GPIO18/19
+    io_conf.pin_bit_mask = GPIO_OUTPUT_PIN_SEL;
+    //disable pull-down mode
+    io_conf.pull_down_en = 0;
+    //disable pull-up mode
+    io_conf.pull_up_en = 0;
+    //configure GPIO with the given settings
+    gpio_config(&io_conf);
+    gpio_set_level(GPIO_OUTPUT_FLASH_LED, 0);
+}
 
 static int s_retry_num = 0;
 //-------------------------------------------------------------------------------------------------
@@ -161,12 +246,12 @@ void wifi_init(void)
 //-------------------------------------------------------------------------------------------------
 static esp_err_t mqtt_event_handler_cb(esp_mqtt_event_handle_t event)
 {
-    esp_mqtt_client_handle_t client = event->client;
+    client = event->client;
     // your_context_t *context = event->context;
     switch (event->event_id) {
         case MQTT_EVENT_CONNECTED:
             printf("MQTT_EVENT_CONNECTED \n");
-            esp_mqtt_client_publish(client, MQTT_TOPIC_BOOT, "boot", 0, 0, 0);
+            esp_mqtt_client_publish(client, (const char *)MQTT_TOPIC_BOOT, "boot", 0, 0, 0);
             esp_mqtt_client_subscribe(client, MQTT_TOPIC_PHOTO, 0);
             esp_mqtt_client_subscribe(client, MQTT_TOPIC_CONFIG, 1);
             break;
@@ -188,8 +273,8 @@ static esp_err_t mqtt_event_handler_cb(esp_mqtt_event_handle_t event)
             printf("DATA=%.*s\r\n", event->data_len, event->data);
             cJSON *root = cJSON_Parse(event->data);
             for (int i=0; i<cJSON_GetArraySize(root); i++) {
+                printf("%s=%d \n",cJSON_GetArrayItem(root,i)->string, cJSON_GetArrayItem(root,i)->valueint);
                 if (strcmp(cJSON_GetArrayItem(root,i)->string, "TakeAPicture")==0) {
-                    printf("TakeAPicture=%d \n", cJSON_GetArrayItem(root,i)->valueint);
                     camera_fb_t *fb = esp_camera_fb_get();
                     if (!fb) printf("Camera capture failed\n"); else {
                         printf("fb->len=%d \n",fb->len);
@@ -198,82 +283,74 @@ static esp_err_t mqtt_event_handler_cb(esp_mqtt_event_handle_t event)
                     }
                 }
                 else if (strcmp(cJSON_GetArrayItem(root,i)->string, "framesize")==0) {
-                    printf("framesize=%d \n", cJSON_GetArrayItem(root,i)->valueint);
                     sensor_t * s = esp_camera_sensor_get();
-                    if (s==NULL) printf("s==NULL"); else 
-                        s->set_framesize(s, cJSON_GetArrayItem(root,i)->valueint);
+                    if (s!=NULL) s->set_framesize(s, cJSON_GetArrayItem(root,i)->valueint);
+                }              
+                else if (strcmp(cJSON_GetArrayItem(root,i)->string, "flash")==0) {
+                    gpio_set_level(GPIO_OUTPUT_FLASH_LED, cJSON_GetArrayItem(root,i)->valueint);
+                }
+                else if (strcmp(cJSON_GetArrayItem(root,i)->string, "motionDetection")==0) {
+                    motionDetection=cJSON_GetArrayItem(root,i)->valueint;
+                }
+                else if (strcmp(cJSON_GetArrayItem(root,i)->string, "motionThrethold")==0) {
+                    motionThrethold=cJSON_GetArrayItem(root,i)->valueint;
+                }
+                else if (strcmp(cJSON_GetArrayItem(root,i)->string, "motionNbPhoto")==0) {
+                    motionNbPhoto=cJSON_GetArrayItem(root,i)->valueint;
+                }
+                else if (strcmp(cJSON_GetArrayItem(root,i)->string, "IP_number")==0) {
+                    write_nvs(-1, "IP_number", cJSON_GetArrayItem(root,i)->valueint );
+                }
+                else if (strcmp(cJSON_GetArrayItem(root,i)->string, "reboot")==0) {
+                    esp_restart();
                 }
                 else if (strcmp(cJSON_GetArrayItem(root,i)->string, "vflip")==0) {
-                    printf("vflip=%d \n", cJSON_GetArrayItem(root,i)->valueint);
                     sensor_t * s = esp_camera_sensor_get();
-                    if (s==NULL) printf("s==NULL"); else 
-                        s->set_vflip(s, cJSON_GetArrayItem(root,i)->valueint);
+                    if (s!=NULL) s->set_vflip(s, cJSON_GetArrayItem(root,i)->valueint);
                 }
                 else if (strcmp(cJSON_GetArrayItem(root,i)->string, "hmirror")==0) {
-                    printf("hmirror=%d \n", cJSON_GetArrayItem(root,i)->valueint);
                     sensor_t * s = esp_camera_sensor_get();
-                    if (s==NULL) printf("s==NULL"); else 
-                        s->set_hmirror(s, cJSON_GetArrayItem(root,i)->valueint);
+                    if (s!=NULL) s->set_hmirror(s, cJSON_GetArrayItem(root,i)->valueint);
                 }
                 else if (strcmp(cJSON_GetArrayItem(root,i)->string, "colorbar")==0) {
-                    printf("colorbar=%d \n", cJSON_GetArrayItem(root,i)->valueint);
                     sensor_t * s = esp_camera_sensor_get();
-                    if (s==NULL) printf("s==NULL"); else 
-                        s->set_colorbar(s, cJSON_GetArrayItem(root,i)->valueint);
+                    if (s!=NULL) s->set_colorbar(s, cJSON_GetArrayItem(root,i)->valueint);
                 }
                 else if (strcmp(cJSON_GetArrayItem(root,i)->string, "special_effect")==0) {
-                    printf("special_effect=%d \n", cJSON_GetArrayItem(root,i)->valueint);
                     sensor_t * s = esp_camera_sensor_get();
-                    if (s==NULL) printf("s==NULL"); else 
-                        s->set_special_effect(s, cJSON_GetArrayItem(root,i)->valueint);
+                    if (s!=NULL) s->set_special_effect(s, cJSON_GetArrayItem(root,i)->valueint);
                 }
                 else if (strcmp(cJSON_GetArrayItem(root,i)->string, "quality")==0) {
-                    printf("quality=%d \n", cJSON_GetArrayItem(root,i)->valueint);
                     sensor_t * s = esp_camera_sensor_get();
-                    if (s==NULL) printf("s==NULL"); else 
-                        s->set_quality(s, cJSON_GetArrayItem(root,i)->valueint);
+                    if (s!=NULL) s->set_quality(s, cJSON_GetArrayItem(root,i)->valueint);
                 }
                 else if (strcmp(cJSON_GetArrayItem(root,i)->string, "brightness")==0) {
-                    printf("brightness=%d \n", cJSON_GetArrayItem(root,i)->valueint);
                     sensor_t * s = esp_camera_sensor_get();
-                    if (s==NULL) printf("s==NULL"); else 
-                        s->set_brightness(s, cJSON_GetArrayItem(root,i)->valueint);
+                    if (s!=NULL) s->set_brightness(s, cJSON_GetArrayItem(root,i)->valueint);
                 }
                 else if (strcmp(cJSON_GetArrayItem(root,i)->string, "contrast")==0) {
-                    printf("contrast=%d \n", cJSON_GetArrayItem(root,i)->valueint);
                     sensor_t * s = esp_camera_sensor_get();
-                    if (s==NULL) printf("s==NULL"); else 
-                        s->set_contrast(s, cJSON_GetArrayItem(root,i)->valueint);
+                    if (s!=NULL) s->set_contrast(s, cJSON_GetArrayItem(root,i)->valueint);
                 }
                 else if (strcmp(cJSON_GetArrayItem(root,i)->string, "saturation")==0) {
-                    printf("saturation=%d \n", cJSON_GetArrayItem(root,i)->valueint);
                     sensor_t * s = esp_camera_sensor_get();
-                    if (s==NULL) printf("s==NULL"); else 
-                        s->set_saturation(s, cJSON_GetArrayItem(root,i)->valueint);
+                    if (s!=NULL) s->set_saturation(s, cJSON_GetArrayItem(root,i)->valueint);
                 }
                 else if (strcmp(cJSON_GetArrayItem(root,i)->string, "sharpness")==0) {
-                    printf("sharpness=%d \n", cJSON_GetArrayItem(root,i)->valueint);
                     sensor_t * s = esp_camera_sensor_get();
-                    if (s==NULL) printf("s==NULL"); else 
-                        s->set_sharpness(s, cJSON_GetArrayItem(root,i)->valueint);
+                    if (s!=NULL) s->set_sharpness(s, cJSON_GetArrayItem(root,i)->valueint);
                 }
                 else if (strcmp(cJSON_GetArrayItem(root,i)->string, "denoise")==0) {
-                    printf("denoise=%d \n", cJSON_GetArrayItem(root,i)->valueint);
                     sensor_t * s = esp_camera_sensor_get();
-                    if (s==NULL) printf("s==NULL"); else 
-                        s->set_denoise(s, cJSON_GetArrayItem(root,i)->valueint);
+                    if (s!=NULL) s->set_denoise(s, cJSON_GetArrayItem(root,i)->valueint);
                 }
                 else if (strcmp(cJSON_GetArrayItem(root,i)->string, "awb_gain")==0) {
-                    printf("awb_gain=%d \n", cJSON_GetArrayItem(root,i)->valueint);
                     sensor_t * s = esp_camera_sensor_get();
-                    if (s==NULL) printf("s==NULL"); else 
-                        s->set_awb_gain(s, cJSON_GetArrayItem(root,i)->valueint);
+                    if (s!=NULL) s->set_awb_gain(s, cJSON_GetArrayItem(root,i)->valueint);
                 }
                 else if (strcmp(cJSON_GetArrayItem(root,i)->string, "wb_mode")==0) {
-                    printf("wb_mode=%d \n", cJSON_GetArrayItem(root,i)->valueint);
                     sensor_t * s = esp_camera_sensor_get();
-                    if (s==NULL) printf("s==NULL"); else 
-                        s->set_wb_mode(s, cJSON_GetArrayItem(root,i)->valueint);
+                    if (s!=NULL) s->set_wb_mode(s, cJSON_GetArrayItem(root,i)->valueint);
                 }
                 else 
                     printf("undefined: %s=%d \n",cJSON_GetArrayItem(root,i)->string, cJSON_GetArrayItem(root,i)->valueint);
@@ -305,7 +382,7 @@ static void mqtt_app_start(void)
         .password = MQTT_PASSWORD,
     };
 
-    esp_mqtt_client_handle_t client = esp_mqtt_client_init(&mqtt_cfg);
+    client = esp_mqtt_client_init(&mqtt_cfg);
     esp_mqtt_client_register_event(client, ESP_EVENT_ANY_ID, mqtt_event_handler, client);
     esp_mqtt_client_start(client);
 }
@@ -319,6 +396,10 @@ static esp_err_t camera_init()
         printf("\n=====> Camera Init Failed \n");
         return err;
     }
+    // Après allocation du buffer maximum, on revient à une resolution moindre     // 1024x768
+    sensor_t * s = esp_camera_sensor_get();
+    if (s!=NULL) s->set_framesize(s, FRAMESIZE_XGA);
+
     return ESP_OK;
 }
 
@@ -330,9 +411,13 @@ static esp_err_t index_handler(httpd_req_t *req){
     p+=sprintf(p, "<html><head><title>ESP32-CAM jyrmqtt esp-idf</title>");
     p+=sprintf(p, "</head><body><table border=0>");
 
-    p+=sprintf(p, "<tr><td><a href=/ >Home</a></td</tr>");
-    p+=sprintf(p, "<tr><td><a href=/capture target=_new>Take photo</a></td</tr>");
-    p+=sprintf(p, "<tr><td><a href=/stream  target=_new>Streaming</a></td</tr>");
+    p+=sprintf(p, "<tr><td><a href=/ >Home</a></td></tr>");
+    p+=sprintf(p, "<tr><td><a href=/capture target=_new>Take photo</a></td></tr>");
+    p+=sprintf(p, "<tr><td><a href=/stream  target=_new>Streaming</a></td></tr>");
+    p+=sprintf(p, "<tr><td>Status:</td></tr>");
+    p+=sprintf(p, "<tr><td>motionDetection=%d</td></tr>",motionDetection);
+    p+=sprintf(p, "<tr><td>motionThrethold=%d</td></tr>",motionThrethold);
+    p+=sprintf(p, "<tr><td>motionNbPhoto=%d</td></tr>",motionNbPhoto);
 
     p+=sprintf(p, "</table>");
     p+=sprintf(p, "</body></html>");
@@ -450,7 +535,56 @@ void start_httpserver(void)
 }
 
 //-------------------------------------------------------------------------------------------------
+void start_motionDetection(void) {
+    // attente 5 sec après reboot
+    vTaskDelay(5000 / portTICK_PERIOD_MS);
+    int32_t current_frame = 0;
+    int32_t prev_frame = 0;
+    int firstTime = 0;
+    int take_nb_photo=0;
+    
+    while(true){
+        if (motionDetection) {
+            camera_fb_t * fb =esp_camera_fb_get();
+            if (fb) {
+                current_frame = 0;
+                for (uint32_t i = 0; i < fb->len; i++) {
+                    current_frame += fb->buf[i];
+                }
+                // compare to previous frame (sauf les 3 premières apres boot)
+                if (firstTime>3) {
+                    float f=(float)prev_frame/(float)current_frame;
+                    if ( f > (1+(motionThrethold/100.0)) || f < (1-(motionThrethold/100.0)) ) {
+                        printf("Motion Detected...%d <> %d (%f)\n", prev_frame, current_frame, f );
+                        take_nb_photo=motionNbPhoto;
+                    }
+                }
+                else
+                    firstTime++;
+                // serie de photos après motion detection
+                if (take_nb_photo>0) {
+                    take_nb_photo--;
+                    // send image through MQTT
+                    esp_mqtt_client_publish(client, MQTT_TOPIC_PICTURE, (const char*)(fb->buf), fb->len, 0, 0);
+                    printf("take_nb_photo=%d \n",take_nb_photo);
+                }
+                // current to prev frame
+                prev_frame = current_frame;
+                esp_camera_fb_return(fb);
+                vTaskDelay(200 / portTICK_PERIOD_MS);
+            }
+            else
+                vTaskDelay(5000 / portTICK_PERIOD_MS);
+        }
+        else
+            vTaskDelay(5000 / portTICK_PERIOD_MS);
+    }
+}
+
+//-------------------------------------------------------------------------------------------------
 void app_main() {
+    // init GPIO pour la Flash LED
+    init_gpio();
     //Initialize NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -458,6 +592,8 @@ void app_main() {
       ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+    // init variables depuis NVS
+    init_globals();
     //Initialize wifi
     wifi_init();
     // start MQTT
@@ -466,6 +602,8 @@ void app_main() {
     camera_init();
     // HTTP streaming
     start_httpserver();
+    // motion detection
+    start_motionDetection();
 
     //vTaskDelay(3000 / portTICK_PERIOD_MS);
     //boucleTestMalloc();   //  --> 3,3 Mo maximum testé
