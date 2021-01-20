@@ -12,20 +12,31 @@ L'idée est de faire fonctionner sur une ESP32-CAM :
  - l'activation du serveur HTTP pour afficher l'image de la camera
  - le streaming video de la camera
  - le stockage de l'adresse IP en NVS pour uploader le même code partout
+ - la mise à jour du code par OTA déclenchée avec MQTT_TOPIC_CONFIG
 
 Adapter la configuration de l'ESP32-CAM à flasher :
 ```
-#define ESP_WIFI_SSID      "ssid"
-#define ESP_WIFI_PASS      "password"
-#define IP_ADDRESS_PREFIX  "192.168.1."  // la dernière valeur est dans NVS (IP_number) modifiable par MQTT_TOPIC_CONFIG
-#define DEFAULT_IP_NUMBER  20
-#define GATEWAY            "192.168.1.1"
-#define NETMASK            "255.255.255.0"
-#define ESP_MAXIMUM_RETRY  5
-#define MQTT_BROKER_URL    "mqtt://192.168.1.136"
-#define MQTT_USERNAME      "mqtt_username"
-#define MQTT_PASSWORD      "mqtt_password"
-#define MQTT_TOPIC_PREFIX  "ESP32_CAM_"
+#define ESP_WIFI_SSID             "ssid"
+#define ESP_WIFI_PASS             "password"
+#define IP_ADDRESS_PREFIX         "192.168.1."  // la dernière valeur est dans NVS (IP_number) modifiable par MQTT_TOPIC_CONFIG
+#define DEFAULT_IP_NUMBER          20
+#define GATEWAY                   "192.168.1.1"
+#define NETMASK                   "255.255.255.0"
+#define OTA_FIRMWARE_UPGRADE_URL  "https://192.168.1.136:8070/firmware.bin" 
+#define OTA_VERSION               "v1.2 du 2021/01/20 15:24"
+#define MQTT_BROKER_URL           "mqtt://192.168.1.136"
+#define MQTT_USERNAME             "mqtt_username"
+#define MQTT_PASSWORD             "mqtt_password"
+#define MQTT_TOPIC_PREFIX         "ESP32_CAM_"
+#define ESP_MAXIMUM_RETRY          5
+```
+
+Pour l'utilisation d'OTA (voir le détail : https://github.com/espressif/esp-idf/tree/master/examples/system/ota), j'utilise "Windows Subsystem for Linux" :
+```
+cd jyrespidf/ESP32CAM-jyrespidf-mqtt-streaming/.pio/build/esp32cam
+openssl req -x509 -newkey rsa:2048 -keyout ca_key.pem -out ca_cert.pem -days 365 -nodes
+cp ca_cert.pem   jyrespidf/ESP32CAM-jyrespidf-mqtt-streaming/server_certs/
+openssl s_server -WWW -key ca_key.pem -cert ca_cert.pem -port 8070
 ```
 
 **Attention**, l'ajout de la librairie esp32-camera ne fonctionne pas correctement sous PlatformIO.
@@ -56,3 +67,4 @@ CONFIG_CAMERA_CORE0=y
 # CONFIG_CAMERA_NO_AFFINITY is not set
 # end of Camera configuration
 ```
+

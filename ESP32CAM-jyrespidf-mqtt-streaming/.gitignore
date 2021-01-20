@@ -4,3 +4,4 @@
 .vscode/launch.json
 .vscode/ipch
 build
+server_certs/ca_cert.pem

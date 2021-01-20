@@ -13,22 +13,30 @@
 #include "cJSON.h"
 #include "esp_camera.h"
 #include <esp_http_server.h>
+#include "esp_ota_ops.h"
+#include "esp_http_client.h"
+#include "esp_https_ota.h"
 
-#define ESP_WIFI_SSID      "ssid"
-#define ESP_WIFI_PASS      "password"
-#define IP_ADDRESS_PREFIX  "192.168.1."  // la dernière valeur est dans NVS (IP_number) modifiable par MQTT_TOPIC_CONFIG
-#define DEFAULT_IP_NUMBER  20
-#define GATEWAY            "192.168.1.1"
-#define NETMASK            "255.255.255.0"
-#define ESP_MAXIMUM_RETRY  5
-#define MQTT_BROKER_URL    "mqtt://192.168.1.136"
-#define MQTT_USERNAME      "username"
-#define MQTT_PASSWORD      "password"
-#define MQTT_TOPIC_PREFIX  "ESP32_CAM_"
+#define ESP_WIFI_SSID             "ssid"
+#define ESP_WIFI_PASS             "password"
+#define IP_ADDRESS_PREFIX         "192.168.1."  // la dernière valeur est dans NVS (IP_number) modifiable par MQTT_TOPIC_CONFIG
+#define DEFAULT_IP_NUMBER          20
+#define GATEWAY                   "192.168.1.1"
+#define NETMASK                   "255.255.255.0"
+#define OTA_FIRMWARE_UPGRADE_URL  "https://192.168.1.136:8070/firmware.bin" 
+// root@ZE0M11J10:~/E/GitHub/jyrespidf/ESP32CAM-jyrespidf-mqtt-streaming/.pio/build/esp32cam# scp firmware.bin  pi@192.168.1.136:/home/pi/ESP32-CAM/
+#define OTA_VERSION               "v1.2 du 2021/01/20 15:24"
+#define MQTT_BROKER_URL           "mqtt://192.168.1.136"
+#define MQTT_USERNAME             "mqtt_username"
+#define MQTT_PASSWORD             "mqtt_password"
+#define MQTT_TOPIC_PREFIX         "ESP32_CAM_"
+#define ESP_MAXIMUM_RETRY          5
 
 #define GPIO_OUTPUT_FLASH_LED    4   // PIN commun avec les DATA du port série donc l'eclairage de la LED vascille
 //#define GPIO_OUTPUT_FLASH_LED    3   //  (on peut toutefois bidouiller en supprimant R13 et y connecter le pin 3)
 #define GPIO_OUTPUT_PIN_SEL  ((1ULL<<GPIO_OUTPUT_FLASH_LED))
+
+extern const uint8_t server_cert_pem_start[] asm("_binary_ca_cert_pem_start");
 
 static uint8_t IP_number=DEFAULT_IP_NUMBER;
 static char IP_ADDRESS[20];
@@ -244,6 +252,36 @@ void wifi_init(void)
 }
 
 //-------------------------------------------------------------------------------------------------
+esp_err_t _http_event_handler(esp_http_client_event_t *evt)
+{
+    switch (evt->event_id) {
+    case HTTP_EVENT_ERROR:
+        printf("HTTP_EVENT_ERROR\n");
+        break;
+    case HTTP_EVENT_ON_CONNECTED:
+        printf("HTTP_EVENT_ON_CONNECTED\n");
+        break;
+    case HTTP_EVENT_HEADER_SENT:
+        printf("HTTP_EVENT_HEADER_SENT\n");
+        break;
+    case HTTP_EVENT_ON_HEADER:
+        printf("HTTP_EVENT_ON_HEADER, key=%s, value=%s \n", evt->header_key, evt->header_value);
+        break;
+    case HTTP_EVENT_ON_DATA:
+        printf("data len=%d \t", evt->data_len);
+        break;
+    case HTTP_EVENT_ON_FINISH:
+        printf("HTTP_EVENT_ON_FINISH\n");
+        break;
+    case HTTP_EVENT_DISCONNECTED:
+        printf("HTTP_EVENT_DISCONNECTED\n");
+        break;
+    }
+    return ESP_OK;
+}
+
+
+//-------------------------------------------------------------------------------------------------
 static esp_err_t mqtt_event_handler_cb(esp_mqtt_event_handle_t event)
 {
     client = event->client;
@@ -303,6 +341,20 @@ static esp_err_t mqtt_event_handler_cb(esp_mqtt_event_handle_t event)
                 }
                 else if (strcmp(cJSON_GetArrayItem(root,i)->string, "reboot")==0) {
                     esp_restart();
+                }
+                else if (strcmp(cJSON_GetArrayItem(root,i)->string, "OTAandReboot")==0) {
+                    esp_http_client_config_t config = {
+                        .url = OTA_FIRMWARE_UPGRADE_URL,
+                        .cert_pem = (char *)server_cert_pem_start,
+                        .skip_cert_common_name_check = true,                        
+                        .event_handler = _http_event_handler,
+                    };
+                    esp_err_t ret = esp_https_ota(&config);
+                    if (ret == ESP_OK) {
+                        esp_restart();
+                    } else {
+                        printf("Firmware upgrade failed\n");
+                    }
                 }
                 else if (strcmp(cJSON_GetArrayItem(root,i)->string, "vflip")==0) {
                     sensor_t * s = esp_camera_sensor_get();
@@ -415,6 +467,7 @@ static esp_err_t index_handler(httpd_req_t *req){
     p+=sprintf(p, "<tr><td><a href=/capture target=_new>Take photo</a></td></tr>");
     p+=sprintf(p, "<tr><td><a href=/stream  target=_new>Streaming</a></td></tr>");
     p+=sprintf(p, "<tr><td>Status:</td></tr>");
+    p+=sprintf(p, "<tr><td>OTA_VERSION=%s</td></tr>",OTA_VERSION);
     p+=sprintf(p, "<tr><td>motionDetection=%d</td></tr>",motionDetection);
     p+=sprintf(p, "<tr><td>motionThrethold=%d</td></tr>",motionThrethold);
     p+=sprintf(p, "<tr><td>motionNbPhoto=%d</td></tr>",motionNbPhoto);
@@ -523,7 +576,7 @@ void start_httpserver(void)
     };
 
     // Start the httpd server
-    printf("Starting HTTP server on port: %d \n", config.server_port);
+    printf("Starting HTTP server  http://%s%d:%d \n", IP_ADDRESS_PREFIX, IP_number, config.server_port);
     if (httpd_start(&server, &config) == ESP_OK) {
         // Set URI handlers
         httpd_register_uri_handler(server, &index_uri);
@@ -636,7 +689,7 @@ int testMalloc(size_t size) {
 
 //-------------------------------------------------------------------------------------------------
 void boucleTestMalloc() {
-  for (int i=50000; i<5000000; i+=50000) {
+  for (int i=10000; i<5000000; i+=10000) {
     printf("%d\n",i);
       if (!(testMalloc(i))) {
               printf("=============>   malloc KO \n");
